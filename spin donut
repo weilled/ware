@@ -1,0 +1,72 @@
+local function renderDonut()
+    local A, B = 0, 0 -- Rotation angles
+    local width, height = 40, 20 -- Screen size in characters
+    local theta_spacing = 0.07
+    local phi_spacing = 0.02
+    local R1, R2, K2 = 1, 2, 5
+    local K1 = width * K2 * 3 / (8 * (R1 + R2))
+
+    while true do
+        local z_buffer = {}
+        local output = {}
+
+        -- Initialize buffers
+        for i = 1, width * height do
+            z_buffer[i] = 0
+            output[i] = ' '
+        end
+
+        -- Render the donut
+        for theta = 0, 2 * math.pi, theta_spacing do
+            for phi = 0, 2 * math.pi, phi_spacing do
+                local cosA, sinA = math.cos(A), math.sin(A)
+                local cosB, sinB = math.cos(B), math.sin(B)
+                local cosTheta, sinTheta = math.cos(theta), math.sin(theta)
+                local cosPhi, sinPhi = math.cos(phi), math.sin(phi)
+
+                local circleX = R2 + R1 * cosTheta
+                local circleY = R1 * sinTheta
+
+                local x = circleX * (cosB * cosPhi + sinA * sinB * sinPhi) - circleY * cosA * sinB
+                local y = circleX * (sinB * cosPhi - sinA * cosB * sinPhi) + circleY * cosA * cosB
+                local z = K2 + cosA * circleX * sinPhi + circleY * sinA
+                local ooz = 1 / z
+
+                local xp = math.floor(width / 2 + K1 * ooz * x)
+                local yp = math.floor(height / 2 - K1 * ooz * y)
+
+                local luminance = cosTheta * cosPhi * sinB - cosA * cosTheta * sinPhi - sinA * sinTheta + cosB * (cosA * sinTheta - cosTheta * sinPhi * sinA)
+
+                if luminance > 0 then
+                    local index = xp + yp * width
+                    if index >= 1 and index <= width * height and ooz > z_buffer[index] then
+                        z_buffer[index] = ooz
+                        local chars = {'.', ',', '-', '~', ':', ';', '=', '!', '*', '#', '$', '@'}
+                        local luminanceIndex = math.floor(luminance * 8)
+                        output[index] = chars[luminanceIndex] or '.'
+                    end
+                end
+            end
+        end
+
+        -- Print the frame
+        local frame = ""
+        for i = 1, width * height do
+            if i % width == 0 then
+                frame = frame .. "\n"
+            end
+            frame = frame .. output[i]
+        end
+
+        print(frame)
+        task.wait(0.05) -- Control speed
+
+        A = A + 0.04
+        B = B + 0.08
+    end
+end
+
+-- Start rendering in a coroutine
+while true do
+spawn(renderDonut)
+end
