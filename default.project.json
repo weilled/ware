@@ -1,0 +1,11 @@
+{
+    "name": "BinarySerializer",
+    "tree": {
+        "$className": "DataModel",
+        "ReplicatedStorage": {
+            "BinarySerializer": {
+                "$path": "src/BinarySerializer.luau"
+            }
+        }
+    }
+}

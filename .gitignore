@@ -1,0 +1,9 @@
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+
+sourcemap.json
+
+aftman/
+_packages/
