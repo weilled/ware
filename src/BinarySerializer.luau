@@ -1,33 +1,49 @@
--- High-performance binary serializer based on the buffer API.
--- Supports: nil, boolean, number, string, table, Vector3, CFrame.
--- Plus toBase64 / fromBase64 utility functions for DataStores.
-
 local Serializer = {}
 
-local TAG_NIL     = 0
-local TAG_FALSE   = 1
-local TAG_TRUE    = 2
-local TAG_U8      = 3
-local TAG_I16     = 4
-local TAG_I32     = 5
-local TAG_F64     = 6
-local TAG_STRING  = 7
-local TAG_TABLE   = 8
+local TAG_NIL = 0
+local TAG_FALSE = 1
+local TAG_TRUE = 2
+local TAG_U8 = 3
+local TAG_I16 = 4
+local TAG_I32 = 5
+local TAG_F64 = 6
+local TAG_STRING = 7
+local TAG_TABLE = 8
 local TAG_VECTOR3 = 9
-local TAG_CFRAME  = 10
+local TAG_CFRAME = 10
+
+local MAX_DEPTH = 32
+local MAX_VARINT_BYTES = 5
+local DEFAULT_CAPACITY = 128
+local MIN_CAPACITY = 16
 
 type Writer = { buf: buffer, cursor: number, capacity: number }
 
 local function writerNew(initialCapacity: number?): Writer
-	local cap = initialCapacity or 128
+	local cap = DEFAULT_CAPACITY
+	if initialCapacity ~= nil then
+		if
+			type(initialCapacity) ~= "number"
+			or initialCapacity ~= initialCapacity
+			or initialCapacity < 0
+			or initialCapacity == math.huge
+		then
+			error("BinarySerializer: initialCapacity must be a finite non-negative number")
+		end
+		cap = math.max(MIN_CAPACITY, math.floor(initialCapacity))
+	end
 	return { buf = buffer.create(cap), cursor = 0, capacity = cap }
 end
 
 local function writerEnsure(w: Writer, bytes: number)
 	local needed = w.cursor + bytes
-	if needed <= w.capacity then return end
-	local newCap = w.capacity
-	repeat newCap *= 2 until newCap >= needed
+	if needed <= w.capacity then
+		return
+	end
+	local newCap = w.capacity * 2
+	if newCap < needed then
+		newCap = needed
+	end
 	local newBuf = buffer.create(newCap)
 	buffer.copy(newBuf, 0, w.buf, 0, w.cursor)
 	w.buf = newBuf
@@ -80,33 +96,47 @@ local function writeString(w: Writer, s: string)
 	w.cursor += len
 end
 
-type Reader = { buf: buffer, cursor: number }
+type Reader = { buf: buffer, cursor: number, len: number }
+
+local function readerEnsure(r: Reader, bytes: number)
+	if r.cursor + bytes > r.len then
+		error(
+			`BinarySerializer: unexpected end of buffer at offset {r.cursor} `
+				.. `(need {bytes} bytes, {r.len - r.cursor} available)`
+		)
+	end
+end
 
 local function readU8(r: Reader): number
+	readerEnsure(r, 1)
 	local v = buffer.readu8(r.buf, r.cursor)
 	r.cursor += 1
 	return v
 end
 
 local function readI16(r: Reader): number
+	readerEnsure(r, 2)
 	local v = buffer.readi16(r.buf, r.cursor)
 	r.cursor += 2
 	return v
 end
 
 local function readI32(r: Reader): number
+	readerEnsure(r, 4)
 	local v = buffer.readi32(r.buf, r.cursor)
 	r.cursor += 4
 	return v
 end
 
 local function readF32(r: Reader): number
+	readerEnsure(r, 4)
 	local v = buffer.readf32(r.buf, r.cursor)
 	r.cursor += 4
 	return v
 end
 
 local function readF64(r: Reader): number
+	readerEnsure(r, 8)
 	local v = buffer.readf64(r.buf, r.cursor)
 	r.cursor += 8
 	return v
@@ -115,17 +145,23 @@ end
 local function readVarint(r: Reader): number
 	local result = 0
 	local shift = 0
-	while true do
+	for _ = 1, MAX_VARINT_BYTES do
 		local b = readU8(r)
+		if shift == 28 and b > 0x0F then
+			error(`BinarySerializer: varint overflows 32 bits at offset {r.cursor - 1}`)
+		end
 		result = bit32.bor(result, bit32.lshift(bit32.band(b, 0x7F), shift))
-		if bit32.band(b, 0x80) == 0 then break end
+		if b < 0x80 then
+			return result
+		end
 		shift += 7
 	end
-	return result
+	error(`BinarySerializer: malformed varint at offset {r.cursor - MAX_VARINT_BYTES}`)
 end
 
 local function readString(r: Reader): string
 	local len = readVarint(r)
+	readerEnsure(r, len)
 	local s = buffer.readstring(r.buf, r.cursor, len)
 	r.cursor += len
 	return s
@@ -134,7 +170,7 @@ end
 local writeValue
 
 local function writeNumber(w: Writer, n: number)
-	if n % 1 == 0 and n == n then
+	if n % 1 == 0 then
 		if n >= 0 and n <= 255 then
 			writeU8(w, TAG_U8)
 			writeU8(w, n)
@@ -153,19 +189,23 @@ local function writeNumber(w: Writer, n: number)
 	writeF64(w, n)
 end
 
+local function isArrayIndex(k: any, arrayLen: number): boolean
+	return type(k) == "number" and k % 1 == 0 and k >= 1 and k <= arrayLen
+end
+
 local function writeTable(w: Writer, t: { [any]: any }, depth: number)
-	if depth > 32 then
-		error("BinarySerializer: maximum nesting depth exceeded (32)")
+	if depth > MAX_DEPTH then
+		error(`BinarySerializer: table nesting exceeds {MAX_DEPTH} levels (cyclic reference?)`)
 	end
 
 	local arrayLen = 0
-	for i in ipairs(t) do
-		arrayLen = i
+	while t[arrayLen + 1] ~= nil do
+		arrayLen += 1
 	end
 
 	local dictCount = 0
 	for k in pairs(t) do
-		if not (type(k) == "number" and k % 1 == 0 and k >= 1 and k <= arrayLen) then
+		if not isArrayIndex(k, arrayLen) then
 			dictCount += 1
 		end
 	end
@@ -179,7 +219,7 @@ local function writeTable(w: Writer, t: { [any]: any }, depth: number)
 	end
 
 	for k, v in pairs(t) do
-		if not (type(k) == "number" and k % 1 == 0 and k >= 1 and k <= arrayLen) then
+		if not isArrayIndex(k, arrayLen) then
 			writeValue(w, k, depth)
 			writeValue(w, v, depth)
 		end
@@ -208,10 +248,18 @@ writeValue = function(w: Writer, v: any, depth: number)
 	elseif t == "CFrame" then
 		writeU8(w, TAG_CFRAME)
 		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = v:GetComponents()
-		writeF32(w, x); writeF32(w, y); writeF32(w, z)
-		writeF32(w, r00); writeF32(w, r01); writeF32(w, r02)
-		writeF32(w, r10); writeF32(w, r11); writeF32(w, r12)
-		writeF32(w, r20); writeF32(w, r21); writeF32(w, r22)
+		writeF32(w, x)
+		writeF32(w, y)
+		writeF32(w, z)
+		writeF32(w, r00)
+		writeF32(w, r01)
+		writeF32(w, r02)
+		writeF32(w, r10)
+		writeF32(w, r11)
+		writeF32(w, r12)
+		writeF32(w, r20)
+		writeF32(w, r21)
+		writeF32(w, r22)
 	else
 		error(`BinarySerializer: unsupported type "{t}"`)
 	end
@@ -219,25 +267,43 @@ end
 
 local readValue
 
-local function readTable(r: Reader): { [any]: any }
+local function readTable(r: Reader, depth: number): { [any]: any }
+	if depth > MAX_DEPTH then
+		error(`BinarySerializer: table nesting exceeds {MAX_DEPTH} levels at offset {r.cursor}`)
+	end
+
 	local arrayLen = readVarint(r)
 	local dictCount = readVarint(r)
-	local t = table.create(arrayLen)
+
+	local available = r.len - r.cursor
+	if arrayLen + dictCount * 2 > available then
+		error(
+			`BinarySerializer: table header declares {arrayLen} array and {dictCount} dictionary entries `
+				.. `but only {available} bytes remain at offset {r.cursor}`
+		)
+	end
+
+	local t: { [any]: any } = table.create(arrayLen)
 
 	for i = 1, arrayLen do
-		t[i] = readValue(r)
+		t[i] = readValue(r, depth)
 	end
 
 	for _ = 1, dictCount do
-		local k = readValue(r)
-		local v = readValue(r)
+		local k = readValue(r, depth)
+		local v = readValue(r, depth)
+		if k == nil then
+			error(`BinarySerializer: nil table key at offset {r.cursor}`)
+		elseif k ~= k then
+			error(`BinarySerializer: NaN table key at offset {r.cursor}`)
+		end
 		t[k] = v
 	end
 
 	return t
 end
 
-readValue = function(r: Reader): any
+readValue = function(r: Reader, depth: number): any
 	local tag = readU8(r)
 
 	if tag == TAG_NIL then
@@ -257,19 +323,29 @@ readValue = function(r: Reader): any
 	elseif tag == TAG_STRING then
 		return readString(r)
 	elseif tag == TAG_TABLE then
-		return readTable(r)
+		return readTable(r, depth + 1)
 	elseif tag == TAG_VECTOR3 then
-		return Vector3.new(readF32(r), readF32(r), readF32(r))
+		local x = readF32(r)
+		local y = readF32(r)
+		local z = readF32(r)
+		return Vector3.new(x, y, z)
 	elseif tag == TAG_CFRAME then
-		return CFrame.new(
-			readF32(r), readF32(r), readF32(r),
-			readF32(r), readF32(r), readF32(r),
-			readF32(r), readF32(r), readF32(r),
-			readF32(r), readF32(r), readF32(r)
-		)
-	else
-		error(`BinarySerializer: unknown type tag {tag} (position {r.cursor - 1})`)
+		local x = readF32(r)
+		local y = readF32(r)
+		local z = readF32(r)
+		local r00 = readF32(r)
+		local r01 = readF32(r)
+		local r02 = readF32(r)
+		local r10 = readF32(r)
+		local r11 = readF32(r)
+		local r12 = readF32(r)
+		local r20 = readF32(r)
+		local r21 = readF32(r)
+		local r22 = readF32(r)
+		return CFrame.new(x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
 	end
+
+	error(`BinarySerializer: unknown type tag {tag} at offset {r.cursor - 1}`)
 end
 
 function Serializer.serialize(value: any, initialCapacity: number?): buffer
@@ -284,64 +360,112 @@ function Serializer.serialize(value: any, initialCapacity: number?): buffer
 end
 
 function Serializer.deserialize(buf: buffer): any
-	local r: Reader = { buf = buf, cursor = 0 }
-	return readValue(r)
+	if typeof(buf) ~= "buffer" then
+		error(`BinarySerializer: deserialize expects a buffer, got {typeof(buf)}`)
+	end
+	local r: Reader = { buf = buf, cursor = 0, len = buffer.len(buf) }
+	return readValue(r, 0)
 end
 
--- ---------- Base64 for DataStore ----------
 local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64_PAD = string.byte("=")
+local B64_INVALID = 255
+
+local B64_ENCODE = buffer.fromstring(B64_CHARS)
+
+local B64_DECODE = buffer.create(256)
+buffer.fill(B64_DECODE, 0, B64_INVALID)
+for i = 1, 64 do
+	buffer.writeu8(B64_DECODE, string.byte(B64_CHARS, i), i - 1)
+end
 
 function Serializer.toBase64(buf: buffer): string
 	local len = buffer.len(buf)
-	local parts = table.create(math.ceil(len / 3))
-	for i = 0, len - 1, 3 do
-		local b1 = buffer.readu8(buf, i)
-		local b2 = if i + 1 < len then buffer.readu8(buf, i + 1) else 0
-		local b3 = if i + 2 < len then buffer.readu8(buf, i + 2) else 0
-		local n = b1 * 65536 + b2 * 256 + b3
-		local c1 = bit32.rshift(n, 18) % 64
-		local c2 = bit32.rshift(n, 12) % 64
-		local c3 = bit32.rshift(n, 6) % 64
-		local c4 = n % 64
-		local chunk = string.sub(B64_CHARS, c1 + 1, c1 + 1)
-			.. string.sub(B64_CHARS, c2 + 1, c2 + 1)
-			.. (if i + 1 < len then string.sub(B64_CHARS, c3 + 1, c3 + 1) else "=")
-			.. (if i + 2 < len then string.sub(B64_CHARS, c4 + 1, c4 + 1) else "=")
-		table.insert(parts, chunk)
+	local out = buffer.create(math.ceil(len / 3) * 4)
+	local i = 0
+	local o = 0
+
+	while i + 3 <= len do
+		local n = buffer.readu8(buf, i) * 65536 + buffer.readu8(buf, i + 1) * 256 + buffer.readu8(buf, i + 2)
+		buffer.writeu8(out, o, buffer.readu8(B64_ENCODE, bit32.rshift(n, 18)))
+		buffer.writeu8(out, o + 1, buffer.readu8(B64_ENCODE, bit32.band(bit32.rshift(n, 12), 63)))
+		buffer.writeu8(out, o + 2, buffer.readu8(B64_ENCODE, bit32.band(bit32.rshift(n, 6), 63)))
+		buffer.writeu8(out, o + 3, buffer.readu8(B64_ENCODE, bit32.band(n, 63)))
+		i += 3
+		o += 4
 	end
-	return table.concat(parts)
+
+	local rest = len - i
+	if rest == 1 then
+		local n = buffer.readu8(buf, i) * 65536
+		buffer.writeu8(out, o, buffer.readu8(B64_ENCODE, bit32.rshift(n, 18)))
+		buffer.writeu8(out, o + 1, buffer.readu8(B64_ENCODE, bit32.band(bit32.rshift(n, 12), 63)))
+		buffer.writeu8(out, o + 2, B64_PAD)
+		buffer.writeu8(out, o + 3, B64_PAD)
+	elseif rest == 2 then
+		local n = buffer.readu8(buf, i) * 65536 + buffer.readu8(buf, i + 1) * 256
+		buffer.writeu8(out, o, buffer.readu8(B64_ENCODE, bit32.rshift(n, 18)))
+		buffer.writeu8(out, o + 1, buffer.readu8(B64_ENCODE, bit32.band(bit32.rshift(n, 12), 63)))
+		buffer.writeu8(out, o + 2, buffer.readu8(B64_ENCODE, bit32.band(bit32.rshift(n, 6), 63)))
+		buffer.writeu8(out, o + 3, B64_PAD)
+	end
+
+	return buffer.tostring(out)
+end
+
+local function b64Value(s: string, index: number): number
+	local v = buffer.readu8(B64_DECODE, string.byte(s, index))
+	if v == B64_INVALID then
+		error(`BinarySerializer: invalid Base64 character "{string.sub(s, index, index)}" at position {index}`)
+	end
+	return v
 end
 
 function Serializer.fromBase64(s: string): buffer
-	s = string.gsub(s, "=", "")
-	local outLen = math.floor(#s * 3 / 4)
-	local buf = buffer.create(outLen)
-	local pos = 0
-	for i = 1, #s, 4 do
-		local n = 0
-		local count = 0
-		for j = 0, 3 do
-			local ch = string.sub(s, i + j, i + j)
-			if ch ~= "" then
-				n = n * 64 + (string.find(B64_CHARS, ch, 1, true) :: number - 1)
-				count += 1
-			else
-				n = n * 64
-			end
-		end
-		local bytes = count - 1
-		if bytes >= 1 and pos < outLen then buffer.writeu8(buf, pos, bit32.rshift(n, 16) % 256); pos += 1 end
-		if bytes >= 2 and pos < outLen then buffer.writeu8(buf, pos, bit32.rshift(n, 8) % 256); pos += 1 end
-		if bytes >= 3 and pos < outLen then buffer.writeu8(buf, pos, n % 256); pos += 1 end
+	if type(s) ~= "string" then
+		error(`BinarySerializer: fromBase64 expects a string, got {typeof(s)}`)
 	end
-	return buf
+
+	local body = string.gsub(s, "=+$", "")
+	local len = #body
+	if len % 4 == 1 then
+		error(`BinarySerializer: invalid Base64 length ({len} characters)`)
+	end
+
+	local out = buffer.create(math.floor(len * 3 / 4))
+	local i = 1
+	local o = 0
+
+	while i + 3 <= len do
+		local n = b64Value(body, i) * 262144
+			+ b64Value(body, i + 1) * 4096
+			+ b64Value(body, i + 2) * 64
+			+ b64Value(body, i + 3)
+		buffer.writeu8(out, o, bit32.rshift(n, 16))
+		buffer.writeu8(out, o + 1, bit32.band(bit32.rshift(n, 8), 255))
+		buffer.writeu8(out, o + 2, bit32.band(n, 255))
+		i += 4
+		o += 3
+	end
+
+	local rest = len - i + 1
+	if rest == 2 then
+		local n = b64Value(body, i) * 64 + b64Value(body, i + 1)
+		buffer.writeu8(out, o, bit32.rshift(n, 4))
+	elseif rest == 3 then
+		local n = b64Value(body, i) * 4096 + b64Value(body, i + 1) * 64 + b64Value(body, i + 2)
+		buffer.writeu8(out, o, bit32.rshift(n, 10))
+		buffer.writeu8(out, o + 1, bit32.band(bit32.rshift(n, 2), 255))
+	end
+
+	return out
 end
 
--- ---------- Self-Test ----------
-function Serializer.selfTest()
+function Serializer.selfTest(): boolean
 	local sample = {
 		name = "Player1",
 		level = 42,
+		small = -1234,
 		hp = 99.5,
 		bigNumber = 5e12,
 		alive = true,
@@ -356,40 +480,93 @@ function Serializer.selfTest()
 	}
 
 	local buf = Serializer.serialize(sample)
-	print(`[selfTest] Serialized data size: {buffer.len(buf)} bytes`)
-
-	-- For comparison: size of the same data in JSON
-	local HttpService = game:GetService("HttpService")
-	local jsonOk, json = pcall(function()
-		local copy = table.clone(sample)
-		copy.position = nil
-		copy.spawn = nil -- JSON does not support Vector3/CFrame at all
-		return HttpService:JSONEncode(copy)
-	end)
-	if jsonOk then
-		print(`[selfTest] For comparison, JSON (excluding Vector3/CFrame): {#json} bytes`)
-	end
-
 	local restored = Serializer.deserialize(buf)
 
-	assert(restored.name == "Player1")
-	assert(restored.level == 42)
-	assert(restored.hp == 99.5)
-	assert(restored.bigNumber == 5e12)
-	assert(restored.alive == true and restored.dead == false)
-	assert((restored.position - sample.position).Magnitude < 1e-4)
-	assert(restored.inventory[1] == "sword")
-	assert(restored.inventory[3].stats.def == -3)
+	assert(restored.name == "Player1", "string mismatch")
+	assert(restored.level == 42, "u8 mismatch")
+	assert(restored.small == -1234, "i16 mismatch")
+	assert(restored.hp == 99.5, "double mismatch")
+	assert(restored.bigNumber == 5e12, "large integer mismatch")
+	assert(restored.alive == true and restored.dead == false, "boolean mismatch")
+	assert((restored.position - sample.position).Magnitude < 1e-4, "Vector3 mismatch")
+	assert((restored.spawn.Position - sample.spawn.Position).Magnitude < 1e-4, "CFrame position mismatch")
+	assert((restored.spawn.LookVector - sample.spawn.LookVector).Magnitude < 1e-4, "CFrame rotation mismatch")
+	assert(#restored.inventory == 3, "array length mismatch")
+	assert(restored.inventory[1] == "sword", "array element mismatch")
+	assert(restored.inventory[3].stats.def == -3, "nested table mismatch")
 
-	-- Base64 roundtrip verification
+	assert(Serializer.deserialize(Serializer.serialize(nil)) == nil, "nil roundtrip failed")
+	assert(Serializer.deserialize(Serializer.serialize("")) == "", "empty string roundtrip failed")
+	assert(Serializer.deserialize(Serializer.serialize(-2147483648)) == -2147483648, "i32 lower bound failed")
+	assert(Serializer.deserialize(Serializer.serialize(2147483647)) == 2147483647, "i32 upper bound failed")
+	assert(Serializer.deserialize(Serializer.serialize(2147483648)) == 2147483648, "i32 overflow fallback failed")
+	assert(Serializer.deserialize(Serializer.serialize(-1e-9)) == -1e-9, "small double roundtrip failed")
+
+	local long = string.rep("x", 5000)
+	assert(Serializer.deserialize(Serializer.serialize(long)) == long, "multi-byte varint length failed")
+	assert(buffer.len(Serializer.serialize({ 1, 2, 3 }, 0)) > 0, "zero initial capacity failed")
+
+	local holes = Serializer.deserialize(Serializer.serialize({ 1, 2, nil, 4 }))
+	assert(holes[1] == 1 and holes[2] == 2 and holes[3] == nil and holes[4] == 4, "sparse array roundtrip failed")
+
+	for size = 0, 8 do
+		local raw = buffer.create(size)
+		for i = 0, size - 1 do
+			buffer.writeu8(raw, i, (i * 37 + 11) % 256)
+		end
+		local decoded = Serializer.fromBase64(Serializer.toBase64(raw))
+		assert(buffer.len(decoded) == size, `Base64 length mismatch for {size} bytes`)
+		for i = 0, size - 1 do
+			assert(buffer.readu8(decoded, i) == buffer.readu8(raw, i), `Base64 byte mismatch for {size} bytes`)
+		end
+	end
+
 	local encoded = Serializer.toBase64(buf)
-	local decoded = Serializer.fromBase64(encoded)
-	assert(buffer.len(decoded) == buffer.len(buf), "base64: size mismatch")
-	local roundtrip = Serializer.deserialize(decoded)
-	assert(roundtrip.name == "Player1", "base64: data corrupted")
-	print(`[selfTest] Base64 roundtrip: OK ({#encoded} characters)`)
+	assert(Serializer.deserialize(Serializer.fromBase64(encoded)).name == "Player1", "Base64 payload roundtrip failed")
 
-	print("[selfTest] BinarySerializer: OK ")
+	assert(not (pcall(Serializer.deserialize, "not a buffer" :: any)), "non-buffer input should error")
+	assert(not (pcall(Serializer.deserialize, buffer.create(0))), "empty buffer should error")
+	assert(not (pcall(Serializer.serialize, print)), "unsupported type should error")
+	assert(not (pcall(Serializer.serialize, 1, -1)), "negative initial capacity should error")
+	assert(not (pcall(Serializer.fromBase64, "A")), "invalid Base64 length should error")
+	assert(not (pcall(Serializer.fromBase64, "A!==")), "invalid Base64 character should error")
+
+	local unknownTag = buffer.create(1)
+	buffer.writeu8(unknownTag, 0, 200)
+	assert(not (pcall(Serializer.deserialize, unknownTag)), "unknown tag should error")
+
+	local oversizedTableHeader = buffer.create(5)
+	buffer.writeu8(oversizedTableHeader, 0, TAG_TABLE)
+	buffer.writeu8(oversizedTableHeader, 1, 0xA0)
+	buffer.writeu8(oversizedTableHeader, 2, 0x8D)
+	buffer.writeu8(oversizedTableHeader, 3, 0x06)
+	buffer.writeu8(oversizedTableHeader, 4, 0x00)
+	assert(not (pcall(Serializer.deserialize, oversizedTableHeader)), "oversized table header should error")
+
+	local nestedLevels = MAX_DEPTH + 2
+	local deepBuffer = buffer.create(nestedLevels * 3 + 1)
+	for level = 0, nestedLevels - 1 do
+		local at = level * 3
+		buffer.writeu8(deepBuffer, at, TAG_TABLE)
+		buffer.writeu8(deepBuffer, at + 1, 1)
+		buffer.writeu8(deepBuffer, at + 2, 0)
+	end
+	buffer.writeu8(deepBuffer, nestedLevels * 3, TAG_NIL)
+	assert(not (pcall(Serializer.deserialize, deepBuffer)), "excessive nesting in stream should error")
+
+	local deepTable = {}
+	local node = deepTable
+	for _ = 1, MAX_DEPTH + 8 do
+		node.child = {}
+		node = node.child
+	end
+	assert(not (pcall(Serializer.serialize, deepTable)), "excessive nesting should error")
+
+	local cyclic = {}
+	cyclic.self = cyclic
+	assert(not (pcall(Serializer.serialize, cyclic)), "cyclic table should error")
+
+	print(`[BinarySerializer] selfTest passed: {buffer.len(buf)} bytes, {#encoded} Base64 characters`)
 	return true
 end
 
