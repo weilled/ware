@@ -96,57 +96,48 @@ local function writeString(w: Writer, s: string)
 	w.cursor += len
 end
 
-type Reader = { buf: buffer, cursor: number, len: number }
-
-local function readerEnsure(r: Reader, bytes: number)
-	if r.cursor + bytes > r.len then
-		error(
-			`BinarySerializer: unexpected end of buffer at offset {r.cursor} `
-				.. `(need {bytes} bytes, {r.len - r.cursor} available)`
-		)
-	end
-end
+type Reader = { buf: buffer, cursor: number, len: number, depth: number }
 
 local function readU8(r: Reader): number
-	readerEnsure(r, 1)
-	local v = buffer.readu8(r.buf, r.cursor)
-	r.cursor += 1
-	return v
+	local at = r.cursor
+	r.cursor = at + 1
+	return buffer.readu8(r.buf, at)
 end
 
 local function readI16(r: Reader): number
-	readerEnsure(r, 2)
-	local v = buffer.readi16(r.buf, r.cursor)
-	r.cursor += 2
-	return v
+	local at = r.cursor
+	r.cursor = at + 2
+	return buffer.readi16(r.buf, at)
 end
 
 local function readI32(r: Reader): number
-	readerEnsure(r, 4)
-	local v = buffer.readi32(r.buf, r.cursor)
-	r.cursor += 4
-	return v
+	local at = r.cursor
+	r.cursor = at + 4
+	return buffer.readi32(r.buf, at)
 end
 
 local function readF32(r: Reader): number
-	readerEnsure(r, 4)
-	local v = buffer.readf32(r.buf, r.cursor)
-	r.cursor += 4
-	return v
+	local at = r.cursor
+	r.cursor = at + 4
+	return buffer.readf32(r.buf, at)
 end
 
 local function readF64(r: Reader): number
-	readerEnsure(r, 8)
-	local v = buffer.readf64(r.buf, r.cursor)
-	r.cursor += 8
-	return v
+	local at = r.cursor
+	r.cursor = at + 8
+	return buffer.readf64(r.buf, at)
 end
 
 local function readVarint(r: Reader): number
-	local result = 0
-	local shift = 0
-	for _ = 1, MAX_VARINT_BYTES do
-		local b = readU8(r)
+	local b = readU8(r)
+	if b < 0x80 then
+		return b
+	end
+
+	local result = b - 0x80
+	local shift = 7
+	for _ = 2, MAX_VARINT_BYTES do
+		b = readU8(r)
 		if shift == 28 and b > 0x0F then
 			error(`BinarySerializer: varint overflows 32 bits at offset {r.cursor - 1}`)
 		end
@@ -161,10 +152,15 @@ end
 
 local function readString(r: Reader): string
 	local len = readVarint(r)
-	readerEnsure(r, len)
-	local s = buffer.readstring(r.buf, r.cursor, len)
-	r.cursor += len
-	return s
+	local at = r.cursor
+	if at + len > r.len then
+		error(
+			`BinarySerializer: string of {len} bytes at offset {at} exceeds the buffer `
+				.. `({r.len - at} bytes remain)`
+		)
+	end
+	r.cursor = at + len
+	return buffer.readstring(r.buf, at, len)
 end
 
 local writeValue
@@ -189,10 +185,6 @@ local function writeNumber(w: Writer, n: number)
 	writeF64(w, n)
 end
 
-local function isArrayIndex(k: any, arrayLen: number): boolean
-	return type(k) == "number" and k % 1 == 0 and k >= 1 and k <= arrayLen
-end
-
 local function writeTable(w: Writer, t: { [any]: any }, depth: number)
 	if depth > MAX_DEPTH then
 		error(`BinarySerializer: table nesting exceeds {MAX_DEPTH} levels (cyclic reference?)`)
@@ -205,7 +197,7 @@ local function writeTable(w: Writer, t: { [any]: any }, depth: number)
 
 	local dictCount = 0
 	for k in pairs(t) do
-		if not isArrayIndex(k, arrayLen) then
+		if type(k) ~= "number" or k % 1 ~= 0 or k < 1 or k > arrayLen then
 			dictCount += 1
 		end
 	end
@@ -219,7 +211,7 @@ local function writeTable(w: Writer, t: { [any]: any }, depth: number)
 	end
 
 	for k, v in pairs(t) do
-		if not isArrayIndex(k, arrayLen) then
+		if type(k) ~= "number" or k % 1 ~= 0 or k < 1 or k > arrayLen then
 			writeValue(w, k, depth)
 			writeValue(w, v, depth)
 		end
@@ -267,10 +259,12 @@ end
 
 local readValue
 
-local function readTable(r: Reader, depth: number): { [any]: any }
+local function readTable(r: Reader): { [any]: any }
+	local depth = r.depth + 1
 	if depth > MAX_DEPTH then
 		error(`BinarySerializer: table nesting exceeds {MAX_DEPTH} levels at offset {r.cursor}`)
 	end
+	r.depth = depth
 
 	local arrayLen = readVarint(r)
 	local dictCount = readVarint(r)
@@ -286,12 +280,12 @@ local function readTable(r: Reader, depth: number): { [any]: any }
 	local t: { [any]: any } = table.create(arrayLen)
 
 	for i = 1, arrayLen do
-		t[i] = readValue(r, depth)
+		t[i] = readValue(r)
 	end
 
 	for _ = 1, dictCount do
-		local k = readValue(r, depth)
-		local v = readValue(r, depth)
+		local k = readValue(r)
+		local v = readValue(r)
 		if k == nil then
 			error(`BinarySerializer: nil table key at offset {r.cursor}`)
 		elseif k ~= k then
@@ -300,10 +294,11 @@ local function readTable(r: Reader, depth: number): { [any]: any }
 		t[k] = v
 	end
 
+	r.depth = depth - 1
 	return t
 end
 
-readValue = function(r: Reader, depth: number): any
+readValue = function(r: Reader): any
 	local tag = readU8(r)
 
 	if tag == TAG_NIL then
@@ -323,7 +318,7 @@ readValue = function(r: Reader, depth: number): any
 	elseif tag == TAG_STRING then
 		return readString(r)
 	elseif tag == TAG_TABLE then
-		return readTable(r, depth + 1)
+		return readTable(r)
 	elseif tag == TAG_VECTOR3 then
 		local x = readF32(r)
 		local y = readF32(r)
@@ -363,8 +358,8 @@ function Serializer.deserialize(buf: buffer): any
 	if typeof(buf) ~= "buffer" then
 		error(`BinarySerializer: deserialize expects a buffer, got {typeof(buf)}`)
 	end
-	local r: Reader = { buf = buf, cursor = 0, len = buffer.len(buf) }
-	return readValue(r, 0)
+	local r: Reader = { buf = buf, cursor = 0, len = buffer.len(buf), depth = 0 }
+	return readValue(r)
 end
 
 local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -462,6 +457,12 @@ function Serializer.fromBase64(s: string): buffer
 end
 
 function Serializer.selfTest(): boolean
+	local inventory: { any } = {
+		"sword",
+		"shield",
+		{ id = 1001, rarity = "epic", stats = { atk = 15, def = -3 } },
+	}
+
 	local sample = {
 		name = "Player1",
 		level = 42,
@@ -472,11 +473,7 @@ function Serializer.selfTest(): boolean
 		dead = false,
 		position = Vector3.new(10, 5.25, -3),
 		spawn = CFrame.new(0, 10, 0) * CFrame.Angles(0, math.rad(90), 0),
-		inventory = {
-			"sword",
-			"shield",
-			{ id = 1001, rarity = "epic", stats = { atk = 15, def = -3 } },
-		},
+		inventory = inventory,
 	}
 
 	local buf = Serializer.serialize(sample)
@@ -506,7 +503,8 @@ function Serializer.selfTest(): boolean
 	assert(Serializer.deserialize(Serializer.serialize(long)) == long, "multi-byte varint length failed")
 	assert(buffer.len(Serializer.serialize({ 1, 2, 3 }, 0)) > 0, "zero initial capacity failed")
 
-	local holes = Serializer.deserialize(Serializer.serialize({ 1, 2, nil, 4 }))
+	local sparse: { any } = { 1, 2, nil, 4 }
+	local holes = Serializer.deserialize(Serializer.serialize(sparse))
 	assert(holes[1] == 1 and holes[2] == 2 and holes[3] == nil and holes[4] == 4, "sparse array roundtrip failed")
 
 	for size = 0, 8 do
@@ -554,15 +552,15 @@ function Serializer.selfTest(): boolean
 	buffer.writeu8(deepBuffer, nestedLevels * 3, TAG_NIL)
 	assert(not (pcall(Serializer.deserialize, deepBuffer)), "excessive nesting in stream should error")
 
-	local deepTable = {}
-	local node = deepTable
+	local deepTable: { [string]: any } = {}
+	local node: { [string]: any } = deepTable
 	for _ = 1, MAX_DEPTH + 8 do
 		node.child = {}
 		node = node.child
 	end
 	assert(not (pcall(Serializer.serialize, deepTable)), "excessive nesting should error")
 
-	local cyclic = {}
+	local cyclic: { [string]: any } = {}
 	cyclic.self = cyclic
 	assert(not (pcall(Serializer.serialize, cyclic)), "cyclic table should error")
 
